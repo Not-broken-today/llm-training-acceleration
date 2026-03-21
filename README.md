@@ -1,6 +1,6 @@
 # llm-training-acceleration
 
-> RU [Русская версия](#-описание-на-русском) | GB [English version](#-description-in-english) 
+> 🇷🇺 [Русский](README.ru.md) | 🇬🇧 [English]
 
 ---
 
