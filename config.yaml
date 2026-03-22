@@ -1,0 +1,93 @@
+defaults:
+  - _self_
+
+model:
+  model_name: "Qwen/Qwen2.5-0.5B"
+  torch_dtype: "bfloat16"
+  trust_remote_code: true
+
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+dataset:
+  name_dataset: "Elriggs/openwebtext-100k"
+  percentage_use: 0.01
+  seed: 42
+  num_proc: 1
+
+tokenization:
+  max_length: 256
+
+# ============================================================
+# ОПТИМИЗАТОРЫ (отдельные конфигурации)
+# ============================================================
+
+optimizers:
+  
+  # --- AdamW (стандартный PyTorch) ---
+  adamw:
+    lr: 5e-5
+    weight_decay: 0.01
+    eps: 1e-8
+    betas: [0.9, 0.999]
+
+  # --- Muon (требует установку: pip install git+https://github.com/KellerJordan/Muon) ---
+  muon:
+    lr: 5e-5
+    wd: 0.01
+    adamw_eps: 1e-8
+    adamw_betas: [0.9, 0.95]
+    momentum: 0.9
+    nesterov: false
+    ns_steps: 5
+
+  # --- Muon + AdamW гибридный ---
+  hybrid:
+    lr: 5e-5
+    wd: 0.1
+    adamw_eps: 1e-8
+    adamw_betas: [0.9, 0.95]
+    momentum: 0.9
+    nesterov: false
+    ns_steps: 5
+
+# Активный оптимизатор (меняйте это поле для переключения)
+active_optimizer: "adamw"
+
+# ============================================================
+# ПАРАМЕТРЫ ОБУЧЕНИЯ
+# ============================================================
+training:
+  output_dir: "./outputs/checkpoints"
+  num_train_epochs: 5
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  bf16: true
+  fp16: false
+  warmup_ratio: 0.1
+  lr_scheduler_type: "cosine"
+  logging_steps: 1
+  save_strategy: "epoch"
+  save_steps: 1
+  save_total_limit: 2
+  report_to: "none"
+  remove_unused_columns: false
+  dataset_text_field: "text"
+  gradient_checkpointing: true
+  seed: 42
+
+logging:
+  log_every_n_steps: 10
+  save_logs: true
