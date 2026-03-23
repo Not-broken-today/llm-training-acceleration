@@ -1,0 +1,543 @@
+\documentclass[a4paper,12pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian]{babel}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{geometry}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+
+\geometry{margin=2.5cm}
+
+% Настройка листингов кода
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\title{Сравнительный анализ оптимизаторов AdamW, Muon и гибридного подхода для параметрически-эффективного дообучения больших языковых моделей}
+\author{Рштуни В.}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+В данном отчёте представлено детальное исследование трёх стратегий оптимизации градиентного спуска для параметрически-эффективного дообучения (LoRA) больших языковых моделей. Рассматриваются: классический адаптивный оптимизатор AdamW, современный оптимизатор Muon на основе матричной ортогонализации, и предложенный гибридный подход, комбинирующий преимущества обоих методов. Для каждого оптимизатора приведены математические формулы, алгоритмы в псевдокоде и анализ вычислительной сложности. Эксперименты проведены на модели Qwen2.5-0.5B с использованием датасета OpenWebText и оценкой на задаче логического вывода PIQA. Результаты показывают, что AdamW обеспечивает наилучшую скорость обучения (0.682 шага/с), Muon экономит $\sim$2\% видеопамяти, а гибридный подход демонстрирует сбалансированные характеристики. Все методы достигают сопоставимого качества на тестовой выборке ($\sim$70\% accuracy), что указывает на достаточность данных методов для задач малого масштаба.
+\end{abstract}
+\newpage
+
+\tableofcontents
+\newpage
+
+\section{Введение}
+\label{sec:intro}
+
+Современные большие языковые модели (LLM) содержат сотни миллионов и миллиарды параметров, что делает их полное дообучение вычислительно дорогостоящим. Методы параметрически-эффективного дообучения, такие как LoRA (Low-Rank Adaptation)~\cite{hu2021lora}, позволяют адаптировать предобученные модели к новым задачам, обновляя лишь малую долю параметров (обычно $<$5\%).
+
+Ключевым компонентом процесса обучения является выбор оптимизатора --- алгоритма, определяющего направление и величину обновления весов модели на основе градиентов функции потерь. В последние годы появились новые методы оптимизации, претендующие на улучшение сходимости и эффективности использования ресурсов по сравнению с классическими подходами.
+
+\textbf{Цель работы}: провести сравнительный анализ трёх оптимизаторов для LoRA-дообучения:
+\begin{enumerate}
+    \item \textbf{AdamW}~\cite{loshchilov2019adamw} --- стандартный адаптивный метод с коррекцией веса;
+    \item \textbf{Muon}~\cite{moonshot2024muon} --- оптимизатор на основе матричной ортогонализации;
+    \item \textbf{Hybrid} --- авторский гибридный подход, комбинирующий Muon и AdamW.
+\end{enumerate}
+
+\textbf{Критерии сравнения}: время обучения, пиковое потребление GPU-памяти, финальное значение функции потерь, точность на тестовой задаче (PIQA), скорость сходимости.
+\newpage
+
+\section{Теоретические основы}
+\label{sec:theory}
+
+\subsection{Постановка задачи обучения}
+
+Пусть дана модель с параметрами $\theta \in \mathbb{R}^d$ и функция потерь $\mathcal{L}(\theta; \mathcal{D})$, вычисляемая на обучающем датасете $\mathcal{D}$. Цель обучения --- найти параметры $\theta^*$, минимизирующие эмпирический риск:
+\begin{equation}
+    \theta^* = \arg\min_{\theta} \mathbb{E}_{(x,y) \sim \mathcal{D}}[\ell(f_\theta(x), y)],
+\end{equation}
+где $\ell$ --- функция потерь для отдельного примера, $f_\theta$ --- предсказание модели.
+
+В контексте дообучения с помощью LoRA исходные веса $W_0$ замораживаются, а к ним добавляется низкоранговое приращение:
+\begin{equation}
+    W = W_0 + \Delta W = W_0 + BA, \quad A \in \mathbb{R}^{r \times k}, \; B \in \mathbb{R}^{n \times r}, \; r \ll \min(n,k).
+\end{equation}
+Обучению подлежат только матрицы $A$ и $B$, что существенно снижает количество обучаемых параметров.
+
+\subsection{Проблемы стандартного стохастического градиентного спуска}
+
+Классический SGD обновляет параметры по правилу:
+\begin{equation}
+    \theta_{t+1} = \theta_t - \eta \cdot g_t, \quad g_t = \nabla_\theta \mathcal{L}(\theta_t),
+\end{equation}
+где $\eta$ --- скорость обучения.
+
+Основные ограничения SGD:
+\begin{itemize}
+    \item \textbf{Чувствительность к масштабу градиентов}: параметры с разными масштабами требуют разных шагов обучения;
+    \item \textbf{Шум мини-батчей}: стохастичность градиентов может приводить к колебаниям траектории;
+    \item \textbf{Отсутствие адаптации}: единая скорость обучения для всех параметров неэффективна для разреженных или редко обновляемых весов.
+\end{itemize}
+
+Эти проблемы мотивируют использование адаптивных методов оптимизации.
+\newpage
+
+\section{Описание оптимизаторов}
+\label{sec:optimizers}
+
+\subsection{AdamW: адаптивный момент с коррекцией веса}
+
+\subsubsection{Идея метода}
+
+AdamW~\cite{loshchilov2019adamw} сочетает преимущества двух подходов:
+\begin{itemize}
+    \item \textbf{Momentum}: накопление экспоненциально затухающего среднего градиентов для сглаживания обновлений;
+    \item \textbf{Adaptive scaling}: нормировка градиентов на оценку их дисперсии для автоматической адаптации шага по каждому параметру;
+    \item \textbf{Weight decay decoupling}: применение регуляризации отдельно от градиентного шага, что улучшает обобщение.
+\end{itemize}
+
+\subsubsection{Математическая формулировка}
+
+На шаге $t$ для каждого параметра $\theta_i$ вычисляются:
+
+\begin{align}
+    m_t &= \beta_1 m_{t-1} + (1 - \beta_1) g_t \quad &\text{(первый момент)} \\
+    v_t &= \beta_2 v_{t-1} + (1 - \beta_2) g_t^2 \quad &\text{(второй момент)} \\
+    \hat{m}_t &= \frac{m_t}{1 - \beta_1^t} \quad &\text{(коррекция смещения)} \\
+    \hat{v}_t &= \frac{v_t}{1 - \beta_2^t} \quad &\text{(коррекция смещения)} \\
+    \theta_{t+1} &= \theta_t - \eta \left( \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} + \lambda \theta_t \right) \quad &\text{(обновление с weight decay)}
+\end{align}
+
+где:
+\begin{itemize}
+    \item $g_t$ --- градиент на шаге $t$;
+    \item $\beta_1, \beta_2 \in [0, 1)$ --- коэффициенты затухания моментов (обычно 0.9 и 0.999);
+    \item $\epsilon > 0$ --- малая константа для численной стабильности ($10^{-8}$);
+    \item $\lambda$ --- коэффициент weight decay;
+    \item $\eta$ --- базовая скорость обучения.
+\end{itemize}
+
+\subsubsection{Псевдокод}
+
+\begin{algorithm}[H]
+\caption{AdamW (упрощённая версия)}
+\label{alg:adamw}
+\begin{algorithmic}[1]
+\Require Параметры $\theta$, градиенты $g$, гиперпараметры $\eta, \beta_1, \beta_2, \epsilon, \lambda$
+\State Инициализировать $m \gets 0$, $v \gets 0$, $t \gets 0$
+\While{не достигнут критерий остановки}
+    \State $t \gets t + 1$
+    \State $g \gets \nabla_\theta \mathcal{L}(\theta)$ \Comment{Вычисление градиента}
+    \State $m \gets \beta_1 \cdot m + (1 - \beta_1) \cdot g$
+    \State $v \gets \beta_2 \cdot v + (1 - \beta_2) \cdot g^2$
+    \State $\hat{m} \gets m / (1 - \beta_1^t)$
+    \State $\hat{v} \gets v / (1 - \beta_2^t)$
+    \State $\theta \gets \theta - \eta \cdot \left( \frac{\hat{m}}{\sqrt{\hat{v}} + \epsilon} + \lambda \cdot \theta \right)$
+\EndWhile
+\State \Return $\theta$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Вычислительная сложность и память}
+
+\begin{itemize}
+    \item \textbf{Память}: $2d$ дополнительных скаляров на параметр ($m$ и $v$);
+    \item \textbf{Вычисления}: $O(d)$ операций на шаг (элементарные покомпонентные операции);
+    \item \textbf{Параллелизация}: тривиальная, все операции покомпонентные.
+\end{itemize}
+
+\subsection{Muon: оптимизация через матричную ортогонализацию}
+
+\subsubsection{Идея метода}
+
+Muon (Matrix Orthogonalization for Updating Networks)~\cite{moonshot2024muon} основан на гипотезе, что направление градиента можно улучшить путём ортогонализации матрицы обновлений. Метод применяет итерации Ньютона-Шульца для приближения полярного разложения градиентной матрицы, что теоретически ускоряет сходимость в задачах с коррелированными градиентами.
+
+Ключевые особенности реализации в данном проекте:
+\begin{itemize}
+    \item Применяется только к \textbf{двумерным тензорам} (весовым матрицам), исключая эмбеддинги и \texttt{lm\_head};
+    \item Использует \textbf{один буфер момента} вместо двух, экономя память;
+    \item Ортогонализация выполняется через \textbf{квинтичные итерации Ньютона-Шульца} с коэффициентами $(a, b, c) = (3.4445, -4.7750, 2.0315)$;
+    \item Автоматическая корректировка learning rate в зависимости от размера матрицы: $\eta_{\text{adj}} = \eta \cdot 0.2 \cdot \sqrt{\max(n, m)}$.
+\end{itemize}
+
+\subsubsection{Математическая формулировка}
+
+Пусть $G \in \mathbb{R}^{n \times m}$ --- матрица градиентов для некоторого весового слоя.
+
+\textbf{Шаг 1: Нормировка и подготовка}
+\begin{equation}
+    X_0 = \frac{G}{\|G\|_F + \epsilon}, \quad \text{если } n > m \text{, то } X_0 \gets X_0^\top
+\end{equation}
+
+\textbf{Шаг 2: Квинтичные итерации Ньютона-Шульца}
+
+Для $k = 0, 1, \ldots, K-1$:
+\begin{align}
+    A_k &= X_k X_k^\top \\
+    B_k &= b \cdot A_k + c \cdot A_k^2 \\
+    X_{k+1} &= a \cdot X_k + B_k X_k
+\end{align}
+где коэффициенты $(a, b, c) = (3.4445, -4.7750, 2.0315)$ подобраны для максимизации скорости сходимости.
+
+\textbf{Шаг 3: Обновление с моментом и корректировкой шага}
+\begin{align}
+    M_t &= \beta M_{t-1} + (1 - \beta) \cdot X_K \\
+    \eta_{\text{adj}} &= \eta \cdot 0.2 \cdot \sqrt{\max(n, m)} \\
+    \theta_{t+1} &= \theta_t - \eta_{\text{adj}} \cdot M_t - \eta \cdot \lambda \cdot \theta_t
+\end{align}
+
+\subsubsection{Псевдокод}
+
+\begin{algorithm}[H]
+\caption{Muon: обновление одного весового матричного параметра}
+\label{alg:muon}
+\begin{algorithmic}[1]
+\Require Матрица весов $W$, градиент $G$, гиперпараметры $\eta, \beta, \lambda, K, (a,b,c)$
+\If{$G$ не является 2D-тензором}
+    \State \Return AdamW-обновление для $G$ \Comment{Fallback для векторов}
+\EndIf
+\State \Comment{Шаг 1: нормировка}
+\State $X \gets G / (\|G\|_F + \epsilon)$
+\If{$\text{rows}(G) > \text{cols}(G)$}
+    \State $X \gets X^\top$
+\EndIf
+\State \Comment{Шаг 2: квинтичные итерации Ньютона-Шульца}
+\For{$k = 1$ \textbf{to} $K$}
+    \State $A \gets X \cdot X^\top$
+    \State $B \gets b \cdot A + c \cdot (A \cdot A)$
+    \State $X \gets a \cdot X + B \cdot X$
+\EndFor
+\If{$\text{rows}(G) > \text{cols}(G)$}
+    \State $X \gets X^\top$
+\EndIf
+\State \Comment{Шаг 3: момент и обновление}
+\State $M \gets \beta \cdot M + (1 - \beta) \cdot X$
+\State $\eta_{\text{adj}} \gets \eta \cdot 0.2 \cdot \sqrt{\max(\text{shape}(W))}$
+\State $W \gets W - \eta_{\text{adj}} \cdot M - \eta \cdot \lambda \cdot W$
+\State \Return $W$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Вычислительная сложность и память}
+
+\begin{itemize}
+    \item \textbf{Память}: $d$ скаляров на параметр (один момент $M$) + временные буферы $O(nm)$ для итераций;
+    \item \textbf{Вычисления}: $O(K \cdot nm \cdot \min(n,m))$ на шаг из-за матричных умножений в итерациях Ньютона-Шульца;
+    \item \textbf{Параллелизация}: матричные операции хорошо параллелятся на GPU, но итеративная природа ограничивает конвейеризацию.
+\end{itemize}
+
+\textbf{Практические замечания}:
+\begin{itemize}
+    \item Число итераций $K$ по умолчанию равно 5; больше итераций дают лучшее приближение, но увеличивают время;
+    \item Для стабильности используется нормировка спектральной нормы и $\epsilon = 10^{-7}$;
+    \item Метод не применяется к 1D-параметрам (bias, layer norm), где ортогонализация не имеет смысла.
+\end{itemize}
+
+\subsection{Hybrid: комбинированный подход}
+
+\subsubsection{Мотивация}
+
+Ни AdamW, ни Muon не являются универсально оптимальными:
+\begin{itemize}
+    \item AdamW быстр и стабилен, но может медленнее сходиться в задачах с сильными корреляциями градиентов;
+    \item Muon теоретически ускоряет сходимость, но требует больше вычислений и может быть нестабилен на ранних этапах обучения.
+\end{itemize}
+
+Идея гибридного подхода: использовать сильные стороны каждого метода, назначая их разным группам параметров.
+
+\subsubsection{Стратегия разделения параметров}
+
+Параметры модели разделяются на две группы согласно алгоритму из \texttt{src/optimizers/optimizer.py}:
+
+\begin{enumerate}
+    \item \textbf{Фильтрация 2D-параметров}: из всех параметров отбираются только двумерные тензоры, исключая те, что содержат в имени \texttt{embed\_tokens} или \texttt{lm\_head}:
+    \begin{lstlisting}[language=Python]
+all_2d_params = [
+    p for p in params
+    if p.ndim >= 2 
+    and "embed_tokens" not in str(p) 
+    and "lm_head" not in str(p)
+]
+    \end{lstlisting}
+    
+    \item \textbf{Разделение пополам}: первые 50\% отобранных 2D-параметров обучаются через Muon, остальные 50\% + все 1D-параметры --- через AdamW:
+    \begin{lstlisting}[language=Python]
+split_idx = len(all_2d_params) // 2
+muon_params = all_2d_params[:split_idx]           # первая половина → Muon
+adamw_params = all_2d_params[split_idx:] + other_params  # вторая половина + остальные → AdamW
+    \end{lstlisting}
+\end{enumerate}
+
+\subsubsection{Псевдокод гибридного оптимизатора}
+
+\begin{algorithm}[H]
+\caption{Hybrid: комбинированное обновление всех параметров}
+\label{alg:hybrid}
+\begin{algorithmic}[1]
+\Require Параметры $\Theta = \{\theta_1, \ldots, \theta_N\}$, градиенты $\{g_1, \ldots, g_N\}$
+\State \Comment{Фильтрация 2D-параметров}
+\State $all\_2d \gets \{ p \in \Theta \mid p.\text{ndim} \ge 2 \land \text{"embed\_tokens"} \notin p \land \text{"lm\_head"} \notin p \}$
+\State $other \gets \Theta \setminus all\_2d$
+\State \Comment{Разделение пополам}
+\State $split \gets \lfloor |all\_2d| / 2 \rfloor$
+\State $muon\_params \gets all\_2d[0:split]$
+\State $adamw\_params \gets all\_2d[split:] \cup other$
+\State \Comment{Обновление через единый интерфейс Muon}
+\State \Return \Call{Muon.step}{$muon\_params$, $adamw\_params$, $g$}
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Преимущества и ограничения}
+
+\textbf{Преимущества}:
+\begin{itemize}
+    \item \textbf{Баланс скорости и качества}: критически важные слои получают более мощную оптимизацию (Muon), остальные --- быструю (AdamW);
+    \item \textbf{Гибкость}: стратегию разделения можно адаптировать под архитектуру;
+    \item \textbf{Обратная совместимость}: при $split = 0$ метод вырождается в чистый AdamW.
+\end{itemize}
+
+\textbf{Ограничения}:
+\begin{itemize}
+    \item \textbf{Эвристика разделения}: выбор первых 50\% матриц может быть неоптимальным для всех архитектур;
+    \item \textbf{Дополнительная сложность}: требуется отслеживание типов и порядков параметров;
+    \item \textbf{Отсутствие теоретических гарантий}: комбинация двух оптимизаторов не имеет формального обоснования сходимости.
+\end{itemize}
+
+\section{Экспериментальная установка}
+\label{sec:experiments}
+
+\subsection{Аппаратное и программное обеспечение}
+
+\begin{table}[H]
+\centering
+\caption{Аппаратная конфигурация}
+\label{tab:hardware}
+\begin{tabular}{lc}
+\toprule
+\textbf{Компонент} & \textbf{Характеристики} \\
+\midrule
+Процессор & Intel Core i5-11400F (6 ядер / 12 потоков) \\
+Оперативная память & 16 ГБ DDR4 \\
+Видеокарта & NVIDIA GeForce RTX 5060 Ti, 16 ГБ VRAM \\
+Операционная система & Windows 10 Pro \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Зависимости программного обеспечения (из \texttt{requirements.txt})}
+\label{tab:software}
+\begin{tabular}{ll}
+\toprule
+\textbf{Пакет} & \textbf{Версия} \\
+\midrule
+torch & 2.10.0+cu128 \\
+datasets & 4.8.2 \\
+hydra-core & 1.3.2 \\
+lm\_eval & 0.4.11 \\
+matplotlib & 3.10.8 \\
+mypy & 1.19.1 \\
+peft & 0.18.1 \\
+psutil & 7.2.2 \\
+pylint & 4.0.5 \\
+tokenizers & 0.22.2 \\
+transformers & 5.3.0 \\
+trl & 0.29.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textit{Примечание}: пакет \texttt{torch} установлен из дополнительного индекса \url{https://download.pytorch.org/whl/cu128} для поддержки CUDA 12.8.
+
+\subsection{Модель и данные}
+
+\begin{table}[H]
+\centering
+\caption{Параметры экспериментальной установки}
+\label{tab:setup}
+\begin{tabular}{ll}
+\toprule
+\textbf{Компонент} & \textbf{Значение} \\
+\midrule
+Модель & Qwen/Qwen2.5-0.5B (502M параметров) \\
+Адаптация & LoRA: $r=16$, $\alpha=32$, dropout=0.05 \\
+Целевые модули & q\_proj, k\_proj, v\_proj, o\_proj, gate\_proj, up\_proj, down\_proj \\
+Обучаемые параметры & 8.8M (1.75\% от общего числа) \\
+Тренировочный датасет & Elriggs/openwebtext-100k (1\% = 1000 сэмплов) \\
+Тестовый датасет & PIQA (1838 примеров логического вывода) \\
+Точность вычислений & bfloat16 (нативная поддержка на RTX 5060 Ti) \\
+Размер батча & 4 на устройство, 4 шага накопления градиентов \\
+Эпохи & 5 \\
+Learning rate & $5 \times 10^{-5}$, cosine schedule с warmup 3\% \\
+Weight decay & 0.01 \\
+Оптимизаторы & AdamW / Muon / Hybrid \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Метрики и протокол оценки}
+
+Для каждого эксперимента фиксируются:
+\begin{enumerate}
+    \item \textbf{Время обучения}: от начала первого шага до завершения последней эпохи;
+    \item \textbf{Пиковая память GPU}: максимальное значение;
+    \item \textbf{Финальный loss}: среднее значение функции потерь на последнем шаге;
+    \item \textbf{PIQA Accuracy}: доля правильных ответов на тестовом датасете после дообучения;
+    \item \textbf{Шагов в секунду}: усреднённая скорость обработки мини-батчей.
+\end{enumerate}
+
+Все эксперименты запускаются с фиксированным random seed (42) для воспроизводимости.
+\newpage
+
+\section{Результаты}
+\label{sec:results}
+
+\subsection{Сводная таблица метрик}
+
+\begin{table}[H]
+\centering
+\caption{Сравнение оптимизаторов по ключевым метрикам}
+\label{tab:results}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Метрика} & \textbf{AdamW} & \textbf{Muon} & \textbf{Hybrid} \\
+\midrule
+Время обучения & \textbf{7м 41с} & 9м 22с & 8м 23с \\
+Пиковая память, МБ & 3912 & \textbf{3846} & 3878 \\
+Финальный loss & \textbf{2.863} & 2.903 & 2.888 \\
+PIQA Accuracy, \% & \textbf{70.29} & 70.13 & 69.86 \\
+Шагов в секунду & \textbf{0.682} & 0.560 & 0.626 \\
+Trainable params & \multicolumn{3}{c}{8.8M (1.75\% от общего числа)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Анализ производительности}
+
+\paragraph{Скорость обучения.}
+AdamW демонстрирует наилучшую производительность: 0.682 шага/с против 0.560 у Muon ($-18\%$). Это объясняется отсутствием итераций Ньютона-Шульца, требующих дополнительных матричных умножений. Гибридный подход занимает промежуточное положение (0.626 шага/с), так как лишь половина параметров обрабатывается более тяжёлым Muon.
+
+\paragraph{Потребление памяти.}
+Muon экономит $\sim$66 МБ ($\sim$1.7\%) видеопамяти по сравнению с AdamW благодаря использованию одного буфера момента вместо двух. Гибридный метод потребляет промежуточное количество памяти, пропорциональное доле параметров, обрабатываемых каждым оптимизатором.
+
+\paragraph{Качество обучения.}
+Все три метода достигают сопоставимого финального loss ($\sim$2.86--2.90) и точности на PIQA ($\sim$70\%). Небольшие различия (менее 0.5\% accuracy) статистически незначимы при данном объёме данных (1000 тренировочных сэмплов). Это указывает на то, что для задач малого масштаба выбор оптимизатора влияет в первую очередь на эффективность, а не на итоговое качество.
+
+\paragraph{Динамика сходимости.}
+Анализ логов показывает, что все оптимизаторы демонстрируют монотонное снижение loss без признаков расходимости. На ранних этапах (первые 2 эпохи) Muon иногда показывает более резкие колебания, что может быть связано с итеративной природой ортогонализации. К концу обучения траектории всех методов стабилизируются.
+\newpage
+
+\section{Заключение}
+\label{sec:conclusion}
+
+В данной работе проведён детальный сравнительный анализ трёх оптимизаторов для LoRA-дообучения больших языковых моделей:
+
+\begin{enumerate}
+    \item \textbf{AdamW} остаётся надёжным выбором для большинства практических задач: он быстр, стабилен и хорошо изучен. Его покомпонентная адаптивность эффективно справляется с разномасштабными градиентами, а коррекция weight decay улучшает обобщение.
+    
+    \item \textbf{Muon} предлагает инновационный подход через матричную ортогонализацию, теоретически ускоряющий сходимость в задачах с коррелированными градиентами. На практике он экономит память и показывает сопоставимое качество, но требует больше вычислений.
+    
+    \item \textbf{Hybrid} демонстрирует, что комбинация методов может давать сбалансированные результаты. Предложенная стратегия разделения параметров (первые 50\% 2D-матриц $\rightarrow$ Muon, остальные $\rightarrow$ AdamW) является простой, но эффективной эвристикой.
+\end{enumerate}
+
+\textbf{Ключевой вывод}: для задач малого и среднего масштаба (как в данном эксперименте) различия в итоговом качестве между оптимизаторами минимальны. Выбор следует делать исходя из ограничений по времени и памяти: AdamW для скорости, Muon для экономии ресурсов, Hybrid для баланса.
+
+\textbf{Практическая рекомендация}: начинайте с AdamW как с базового варианта. При наличии избыточного времени или требований к минимизации памяти экспериментируйте с Muon или гибридными схемами, обязательно проводя валидацию на отложенной выборке.
+
+\section*{Список литературы}
+\label{sec:references}
+
+\begin{thebibliography}{9}
+
+\bibitem{loshchilov2019adamw}
+Loshchilov I., Hutter F. 
+\textit{Decoupled Weight Decay Regularization}. 
+International Conference on Learning Representations (ICLR), 2019.
+
+\bibitem{hu2021lora}
+Hu E. J. et al. 
+\textit{LoRA: Low-Rank Adaptation of Large Language Models}. 
+arXiv preprint arXiv:2106.09685, 2021.
+
+\bibitem{moonshot2024muon}
+MoonshotAI. 
+\textit{Muon: Matrix Orthogonalization for Efficient LLM Training}. 
+GitHub repository, 2024. 
+\url{https://github.com/MoonshotAI/Moonlight}
+
+\bibitem{bisk2020piqa}
+Bisk Y. et al. 
+\textit{PIQA: Reasoning about Physical Commonsense in Natural Language}. 
+Proceedings of the AAAI Conference on Artificial Intelligence, 2020.
+
+\bibitem{mezo2023}
+Malladi S. et al. 
+\textit{MeZO: Memory-Efficient Zeroth-Order Optimizer for LLM Fine-tuning}. 
+arXiv preprint arXiv:2305.17333, 2023.
+
+\bibitem{schulz1933newton}
+Schulz G. 
+\textit{Iterative Berechnung der reziproken Matrix}. 
+Zeitschrift für Angewandte Mathematik und Mechanik, 1933.
+
+\end{thebibliography}
+
+\appendix
+\section*{Приложение: Исходные логи экспериментов}
+
+Полные логи обучения и оценки доступны в репозитории:
+\begin{itemize}
+    \item \texttt{outputs/checkpoints/metrics\_adamw.json}
+    \item \texttt{outputs/checkpoints/metrics\_muon.json}
+    \item \texttt{outputs/checkpoints/metrics\_hybrid.json}
+    \item \texttt{logs/train\_*.log}
+\end{itemize}
+
+Для воспроизведения результатов выполните:
+\begin{lstlisting}[language=bash]
+# Клонирование репозитория
+git clone https://github.com/Not-broken-today/llm-training-acceleration
+cd llm-training-acceleration
+
+# Установка зависимостей
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+
+# Запуск эксперимента (пример для AdamW)
+bash run_file/AdamW_run.sh
+
+# Проверка кода
+bash pylint_test_code.sh
+mypy src/
+\end{lstlisting}
+
+\end{document}
