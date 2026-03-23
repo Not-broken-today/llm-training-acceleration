@@ -1,0 +1,9 @@
+{
+  "optimizer": "adamw",
+  "training_time": 516.7228400707245,
+  "final_loss": 2.8632819433060903,
+  "piqa_accuracy": 0.7029379760609358,
+  "max_memory_mb": 3912.0,
+  "train_samples": 1000,
+  "train_steps": 315
+}

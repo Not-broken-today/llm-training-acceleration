@@ -1,0 +1,9 @@
+{
+  "optimizer": "muon",
+  "training_time": 622.6947684288025,
+  "final_loss": 2.9027232457721044,
+  "piqa_accuracy": 0.7013057671381937,
+  "max_memory_mb": 3862.0,
+  "train_samples": 1000,
+  "train_steps": 315
+}

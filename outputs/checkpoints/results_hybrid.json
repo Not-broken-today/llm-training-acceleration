@@ -1,0 +1,9 @@
+{
+  "optimizer": "hybrid",
+  "training_time": 563.2508273124695,
+  "final_loss": 2.8882102890620156,
+  "piqa_accuracy": 0.6985854189336235,
+  "max_memory_mb": 3878.0,
+  "train_samples": 1000,
+  "train_steps": 315
+}
