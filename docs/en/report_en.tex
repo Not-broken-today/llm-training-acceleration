@@ -1,0 +1,572 @@
+\documentclass[a4paper,12pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[english]{babel}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{geometry}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+
+\geometry{margin=2.5cm}
+
+% Code listing configuration
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\title{Comparative Analysis of AdamW, Muon, and Hybrid Optimizers for Parameter-Efficient Fine-Tuning of Large Language Models}
+\author{Rshtuni V.}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report presents a detailed study of three gradient descent optimization strategies for parameter-efficient fine-tuning (LoRA) of large language models. We examine: the classical adaptive optimizer AdamW, the modern Muon optimizer based on matrix orthogonalization (implementation based on \texttt{MoonshotAI/Moonlight}~\cite{moonshot2024muon}), and a proposed hybrid approach combining the advantages of both methods. Implementation of the MeZO optimizer was optional (challenge) and was not completed in this study. For each optimizer, we provide mathematical formulations, pseudocode algorithms, and computational complexity analysis. Experiments were conducted on the Qwen2.5-0.5B model using the OpenWebText dataset (1\%) and evaluation on the PIQA logical reasoning task. Results show that AdamW provides the best training speed (0.682 steps/s), Muon saves $\sim$2\% GPU memory, and the hybrid approach demonstrates balanced characteristics. All methods achieve comparable quality on the test set ($\sim$70\% accuracy).
+\end{abstract}
+\newpage
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+\label{sec:intro}
+
+\subsection{Problem Relevance}
+
+Modern large language models (LLMs) contain hundreds of millions to billions of parameters, making their full fine-tuning computationally expensive. Parameter-efficient fine-tuning methods, such as LoRA (Low-Rank Adaptation)~\cite{hu2021lora}, enable adaptation of pre-trained models to new tasks by updating only a small fraction of parameters. According to~\cite{hu2021lora}, when applied to GPT-3 175B, the number of trainable parameters can be as low as \textbf{0.01\%} of the total, while in experiments with RoBERTa and DeBERTa it ranges from \textbf{0.24\%} to \textbf{0.31\%}.
+
+A key component of the training process is the choice of optimizer --- an algorithm that determines the direction and magnitude of model weight updates based on loss function gradients. In recent years, new optimization methods have emerged, claiming to improve convergence and resource efficiency compared to classical approaches.
+
+\subsection{Problem Statement}
+
+This study conducts a comparative analysis of optimizers for LoRA fine-tuning according to the technical specification:
+
+\begin{enumerate}
+    \item \textbf{AdamW}~\cite{loshchilov2019adamw} --- standard adaptive method with weight decay correction (base task);
+    \item \textbf{Muon}~\cite{moonshot2024muon} --- optimizer based on matrix orthogonalization (base task);
+    \item \textbf{Hybrid} --- author's hybrid approach combining Muon and AdamW (challenge task);
+    \item \textbf{MeZO}~\cite{mezo2023} --- gradient-free optimizer (challenge task, not implemented).
+\end{enumerate}
+
+\textbf{Objective}: Conduct a comparative analysis of the three implemented optimizers according to the following criteria:
+\begin{itemize}
+    \item Training time;
+    \item Peak GPU memory consumption;
+    \item Final loss function value;
+    \item Accuracy on the test task (PIQA);
+    \item Convergence speed.
+\end{itemize}
+
+\textbf{Note on MeZO}: Implementation of the MeZO optimizer was optional (challenge) within the technical specification and was not completed in this study. Priority was given to detailed analysis of AdamW, Muon, and their hybrid combination, enabling a more in-depth comparison of the primary methods.
+
+\subsection{Report Structure}
+
+The report is organized as follows:
+\begin{itemize}
+    \item Section~\ref{sec:theory} --- theoretical foundations of training and LoRA;
+    \item Section~\ref{sec:optimizers} --- optimizer descriptions with formulas and pseudocode;
+    \item Section~\ref{sec:experiments} --- experimental setup;
+    \item Section~\ref{sec:results} --- results and analysis;
+    \item Section~\ref{sec:conclusion} --- conclusions and recommendations;
+    \item Appendix --- instructions for reproducing results.
+\end{itemize}
+\newpage
+
+\section{Theoretical Foundations}
+\label{sec:theory}
+
+\subsection{Training Problem Formulation}
+
+Let a model with parameters $\theta \in \mathbb{R}^d$ and a loss function $\mathcal{L}(\theta; \mathcal{D})$ computed on training dataset $\mathcal{D}$ be given. The training objective is to find parameters $\theta^*$ that minimize empirical risk:
+\begin{equation}
+    \theta^* = \arg\min_{\theta} \mathbb{E}_{(x,y) \sim \mathcal{D}}[\ell(f_\theta(x), y)],
+\end{equation}
+where $\ell$ is the loss function for a single example, and $f_\theta$ is the model prediction.
+
+\subsection{LoRA: Low-Rank Adaptation}
+
+In the context of LoRA fine-tuning, the original weights $W_0$ are frozen, and a low-rank increment is added:
+\begin{equation}
+    W = W_0 + \Delta W = W_0 + BA, \quad A \in \mathbb{R}^{r \times k}, \; B \in \mathbb{R}^{n \times r}, \; r \ll \min(n,k).
+\end{equation}
+Only matrices $A$ and $B$ are trained, substantially reducing the number of trainable parameters.
+
+\textbf{LoRA advantages}:
+\begin{itemize}
+    \item Significant reduction in trainable parameters (down to 0.01--0.3\% of total~\cite{hu2021lora});
+    \item No inference latency overhead (adapters can be merged with base weights);
+    \item Ability to store multiple adapters for different tasks.
+\end{itemize}
+
+\subsection{Limitations of Standard Stochastic Gradient Descent}
+
+Classical SGD updates parameters according to:
+\begin{equation}
+    \theta_{t+1} = \theta_t - \eta \cdot g_t, \quad g_t = \nabla_\theta \mathcal{L}(\theta_t),
+\end{equation}
+where $\eta$ is the learning rate.
+
+Main limitations of SGD:
+\begin{itemize}
+    \item \textbf{Sensitivity to gradient scale}: parameters with different scales require different learning steps;
+    \item \textbf{Mini-batch noise}: gradient stochasticity may cause trajectory oscillations;
+    \item \textbf{Lack of adaptation}: a single learning rate for all parameters is inefficient for sparse or rarely updated weights.
+\end{itemize}
+
+These limitations motivate the use of adaptive optimization methods.
+\newpage
+
+\section{Optimizer Descriptions}
+\label{sec:optimizers}
+
+\subsection{AdamW: Adaptive Moment Estimation with Weight Decay Correction}
+
+\subsubsection{Method Idea}
+
+AdamW~\cite{loshchilov2019adamw} combines advantages of two approaches:
+\begin{itemize}
+    \item \textbf{Momentum}: accumulation of exponentially decaying gradient averages to smooth updates;
+    \item \textbf{Adaptive scaling}: normalization of gradients by their variance estimates for automatic per-parameter step adaptation;
+    \item \textbf{Weight decay decoupling}: application of regularization separately from the gradient step, improving generalization.
+\end{itemize}
+
+\subsubsection{Mathematical Formulation}
+
+At step $t$, for each parameter $\theta_i$, compute:
+
+\begin{align}
+    m_t &= \beta_1 m_{t-1} + (1 - \beta_1) g_t \quad &\text{(first moment)} \\
+    v_t &= \beta_2 v_{t-1} + (1 - \beta_2) g_t^2 \quad &\text{(second moment)} \\
+    \hat{m}_t &= \frac{m_t}{1 - \beta_1^t} \quad &\text{(bias correction)} \\
+    \hat{v}_t &= \frac{v_t}{1 - \beta_2^t} \quad &\text{(bias correction)} \\
+    \theta_{t+1} &= \theta_t - \eta \left( \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon} + \lambda \theta_t \right) \quad &\text{(update with weight decay)}
+\end{align}
+
+where:
+\begin{itemize}
+    \item $g_t$ --- gradient at step $t$;
+    \item $\beta_1 = 0.9$, $\beta_2 = 0.999$ --- momentum decay coefficients (standard values for pure AdamW per~\cite{loshchilov2019adamw});
+    \item $\epsilon = 10^{-8}$ --- small constant for numerical stability;
+    \item $\lambda$ --- weight decay coefficient;
+    \item $\eta$ --- base learning rate.
+\end{itemize}
+
+\subsubsection{Pseudocode}
+
+\begin{algorithm}[H]
+\caption{AdamW}
+\label{alg:adamw}
+\begin{algorithmic}[1]
+\Require Parameters $\theta$, gradients $g$, hyperparameters $\eta, \beta_1, \beta_2, \epsilon, \lambda$
+\State Initialize $m \gets 0$, $v \gets 0$, $t \gets 0$
+\While{stopping criterion not met}
+    \State $t \gets t + 1$
+    \State $g \gets \nabla_\theta \mathcal{L}(\theta)$ \Comment{Compute gradient}
+    \State $m \gets \beta_1 \cdot m + (1 - \beta_1) \cdot g$
+    \State $v \gets \beta_2 \cdot v + (1 - \beta_2) \cdot g^2$
+    \State $\hat{m} \gets m / (1 - \beta_1^t)$
+    \State $\hat{v} \gets v / (1 - \beta_2^t)$
+    \State $\theta \gets \theta - \eta \cdot \left( \frac{\hat{m}}{\sqrt{\hat{v}} + \epsilon} + \lambda \cdot \theta \right)$
+\EndWhile
+\State \Return $\theta$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Computational Complexity and Memory}
+
+\begin{itemize}
+    \item \textbf{Memory}: $2d$ additional scalars per parameter ($m$ and $v$);
+    \item \textbf{Computations}: $O(d)$ operations per step (element-wise operations);
+    \item \textbf{Parallelization}: trivial, all operations are element-wise.
+\end{itemize}
+
+\subsection{Muon: Optimization via Matrix Orthogonalization}
+
+\subsubsection{Method Idea}
+
+Muon (Matrix Orthogonalization for Updating Networks)~\cite{moonshot2024muon} is based on the hypothesis that the gradient direction can be improved by orthogonalizing the update matrix. The method applies Newton-Schulz iterations to approximate the polar decomposition of the gradient matrix, theoretically accelerating convergence in tasks with correlated gradients.
+
+Key implementation features:
+\begin{itemize}
+    \item Applied only to \textbf{2D tensors} (weight matrices), excluding embeddings and \texttt{lm\_head};
+    \item Uses \textbf{a single moment buffer} instead of two, saving memory;
+    \item Orthogonalization performed via \textbf{quintic Newton-Schulz iterations} with coefficients $(a, b, c) = (3.4445, -4.7750, 2.0315)$;
+    \item Default number of iterations: $K = 5$ (empirically chosen as balance between accuracy and speed);
+    \item Automatic learning rate adjustment based on matrix size: $\eta_{\text{adj}} = \eta \cdot 0.2 \cdot \sqrt{\max(n, m)}$.
+\end{itemize}
+
+\subsubsection{Mathematical Formulation}
+
+Let $G \in \mathbb{R}^{n \times m}$ be the gradient matrix for a weight layer.
+
+\textbf{Note on hyperparameters}: 
+\begin{itemize}
+    \item For \textbf{pure AdamW}, standard values $\beta_1 = 0.9$, $\beta_2 = 0.999$ are used;
+    \item In the \textbf{Muon} implementation (based on \texttt{MoonshotAI/Moonlight}), internal updates for 1D parameters and fallback logic use $\beta_1 = 0.9$, $\beta_2 = 0.95$;
+    \item In \textbf{hybrid mode}, parameters processed via the AdamW component inherit the same $\beta_1 = 0.9$, $\beta_2 = 0.95$ for consistency with the code.
+\end{itemize}
+
+\textbf{Step 1: Normalization and preparation}
+\begin{equation}
+    X_0 = \frac{G}{\|G\|_F + \epsilon}, \quad \text{if } n > m \text{, then } X_0 \gets X_0^\top
+\end{equation}
+
+\textbf{Step 2: Quintic Newton-Schulz iterations}
+
+For $k = 0, 1, \ldots, K-1$:
+\begin{align}
+    A_k &= X_k X_k^\top \\
+    B_k &= b \cdot A_k + c \cdot A_k^2 \\
+    X_{k+1} &= a \cdot X_k + B_k X_k
+\end{align}
+where coefficients $(a, b, c) = (3.4445, -4.7750, 2.0315)$ are tuned to maximize convergence speed~\cite{moonshot2024muon}.
+
+\textbf{Step 3: Update with momentum and step adjustment}
+\begin{align}
+    M_t &= \beta M_{t-1} + (1 - \beta) \cdot X_K \\
+    \eta_{\text{adj}} &= \eta \cdot 0.2 \cdot \sqrt{\max(n, m)} \\
+    \theta_{t+1} &= \theta_t - \eta_{\text{adj}} \cdot M_t - \eta \cdot \lambda \cdot \theta_t
+\end{align}
+
+\subsubsection{Pseudocode}
+
+\begin{algorithm}[H]
+\caption{Muon: Update of a single weight matrix parameter}
+\label{alg:muon}
+\begin{algorithmic}[1]
+\Require Weight matrix $W$, gradient $G$, hyperparameters $\eta, \beta, \lambda, K, (a,b,c)$
+\If{$G$ is not a 2D tensor}
+    \State \Return AdamW update for $G$ \Comment{Fallback for vectors}
+\EndIf
+\State \Comment{Step 1: normalization}
+\State $X \gets G / (\|G\|_F + \epsilon)$
+\If{$\text{rows}(G) > \text{cols}(G)$}
+    \State $X \gets X^\top$
+\EndIf
+\State \Comment{Step 2: quintic Newton-Schulz iterations}
+\For{$k = 1$ \textbf{to} $K$}
+    \State $A \gets X \cdot X^\top$
+    \State $B \gets b \cdot A + c \cdot (A \cdot A)$
+    \State $X \gets a \cdot X + B \cdot X$
+\EndFor
+\If{$\text{rows}(G) > \text{cols}(G)$}
+    \State $X \gets X^\top$
+\EndIf
+\State \Comment{Step 3: momentum and update}
+\State $M \gets \beta \cdot M + (1 - \beta) \cdot X$
+\State $\eta_{\text{adj}} \gets \eta \cdot 0.2 \cdot \sqrt{\max(\text{shape}(W))}$
+\State $W \gets W - \eta_{\text{adj}} \cdot M - \eta \cdot \lambda \cdot W$
+\State \Return $W$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Computational Complexity and Memory}
+
+\begin{itemize}
+    \item \textbf{Memory}: $d$ scalars per parameter (one moment $M$) + temporary buffers $O(nm)$ for iterations;
+    \item \textbf{Computations}: $O(K \cdot nm \cdot \min(n,m))$ per step due to matrix multiplications in Newton-Schulz iterations;
+    \item \textbf{Parallelization}: matrix operations parallelize well on GPU, but iterative nature limits pipelining.
+\end{itemize}
+
+\subsection{Hybrid: Combined Approach}
+
+\subsubsection{Motivation}
+
+Neither AdamW nor Muon is universally optimal:
+\begin{itemize}
+    \item AdamW is fast and stable but may converge slower in tasks with strongly correlated gradients;
+    \item Muon theoretically accelerates convergence but requires more computation and may be unstable in early training stages.
+\end{itemize}
+
+The hybrid approach idea: leverage strengths of each method by assigning them to different parameter groups.
+
+\subsubsection{Parameter Partitioning Strategy}
+
+Model parameters are split into two groups according to the algorithm in \texttt{src/optimizers/optimizer.py}:
+
+\begin{enumerate}
+    \item \textbf{2D parameter filtering}: from all parameters, select only 2D tensors, excluding those containing \texttt{embed\_tokens} or \texttt{lm\_head} in their name:
+    \begin{lstlisting}[language=Python]
+all_2d_params = [
+    p for p in params
+    if p.ndim >= 2 
+    and "embed_tokens" not in str(p) 
+    and "lm_head" not in str(p)
+]
+    \end{lstlisting}
+    
+    \item \textbf{Half-split}: first 50\% of selected 2D parameters are trained via Muon, remaining 50\% + all 1D parameters --- via AdamW:
+    \begin{lstlisting}[language=Python]
+split_idx = len(all_2d_params) // 2
+muon_params = all_2d_params[:split_idx]
+adamw_params = all_2d_params[split_idx:] + other_params
+    \end{lstlisting}
+\end{enumerate}
+
+\subsubsection{Hybrid Optimizer Pseudocode}
+
+\begin{algorithm}[H]
+\caption{Hybrid: Combined update of all parameters}
+\label{alg:hybrid}
+\begin{algorithmic}[1]
+\Require Parameters $\Theta = \{\theta_1, \ldots, \theta_N\}$, gradients $\{g_1, \ldots, g_N\}$
+\State \Comment{Filter 2D parameters}
+\State $all\_2d \gets \{ p \in \Theta \mid p.\text{ndim} \ge 2 \land \text{"embed\_tokens"} \notin p \land \text{"lm\_head"} \notin p \}$
+\State $other \gets \Theta \setminus all\_2d$
+\State \Comment{Split in half}
+\State $split \gets \lfloor |all\_2d| / 2 \rfloor$
+\State $muon\_params \gets all\_2d[0:split]$
+\State $adamw\_params \gets all\_2d[split:] \cup other$
+\State \Comment{Update via unified Muon interface}
+\State \Return \Call{Muon.step}{$muon\_params$, $adamw\_params$, $g$}
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Advantages and Limitations}
+
+\textbf{Advantages}:
+\begin{itemize}
+    \item \textbf{Speed-quality balance}: critically important layers receive more powerful optimization (Muon), others --- fast (AdamW);
+    \item \textbf{Flexibility}: partitioning strategy can be adapted to architecture;
+    \item \textbf{Backward compatibility}: when $split = 0$, the method degenerates to pure AdamW.
+\end{itemize}
+
+\textbf{Limitations}:
+\begin{itemize}
+    \item \textbf{Heuristic partitioning}: selecting first 50\% of matrices may be suboptimal for all architectures;
+    \item \textbf{Added complexity}: requires tracking parameter types and ordering;
+    \item \textbf{No theoretical guarantees}: combining two optimizers lacks formal convergence proof.
+\end{itemize}
+\newpage
+
+\section{Experimental Setup}
+\label{sec:experiments}
+
+\subsection{Hardware and Software}
+
+\begin{table}[H]
+\centering
+\caption{Hardware Configuration}
+\label{tab:hardware}
+\begin{tabular}{lc}
+\toprule
+\textbf{Component} & \textbf{Specifications} \\
+\midrule
+CPU & Intel Core i5-11400F (6 cores / 12 threads) \\
+RAM & 16 GB DDR4 \\
+GPU & NVIDIA GeForce RTX 5060 Ti, 16 GB VRAM* \\
+Operating System & Windows 10 Pro \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textit{*Note}: The specified GPU is beyond publicly available specifications at the time of writing; characteristics are provided as reported by the experiment author. bfloat16 support is assumed based on architecture.
+
+\begin{table}[H]
+\centering
+\caption{Software Dependencies (from \texttt{requirements.txt})}
+\label{tab:software}
+\begin{tabular}{ll}
+\toprule
+\textbf{Package} & \textbf{Version} \\
+\midrule
+torch & 2.10.0+cu128 \\
+datasets & 4.8.2 \\
+hydra-core & 1.3.2 \\
+lm\_eval & 0.4.11 \\
+matplotlib & 3.10.8 \\
+mypy & 1.19.1 \\
+peft & 0.18.1 \\
+psutil & 7.2.2 \\
+pylint & 4.0.5 \\
+tokenizers & 0.22.2 \\
+transformers & 5.3.0 \\
+trl & 0.29.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Model and Data}
+
+\begin{table}[H]
+\centering
+\caption{Experimental Setup Parameters}
+\label{tab:setup}
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Value} \\
+\midrule
+Model & Qwen/Qwen2.5-0.5B (~0.49B parameters) \\
+Adaptation & LoRA: $r=16$, $\alpha=32$, dropout=0.05 \\
+Target modules & q\_proj, k\_proj, v\_proj, o\_proj, gate\_proj, up\_proj, down\_proj \\
+Trainable parameters & 8.8M (1.75\% of total) \\
+Training dataset & Elriggs/openwebtext-100k (1\% = 1000 samples) \\
+Test dataset & PIQA (evaluation on test subset; original: 3000 examples) \\
+Computational precision & bfloat16 (assumed support on target platform) \\
+Batch size & 4 per device, 4 gradient accumulation steps \\
+Epochs & 5 \\
+Learning rate & $5 \times 10^{-5}$, cosine schedule with 3\% warmup \\
+Weight decay & 0.01 (AdamW, Muon), 0.1 (Hybrid) \\
+Optimizers & AdamW / Muon / Hybrid \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Metrics and Evaluation Protocol}
+
+For each experiment, we record:
+\begin{enumerate}
+    \item \textbf{Training time}: from start of first step to completion of final epoch;
+    \item \textbf{Peak GPU memory}: maximum value observed;
+    \item \textbf{Final loss}: average loss value at final step;
+    \item \textbf{PIQA Accuracy}: fraction of correct answers on test dataset after fine-tuning;
+    \item \textbf{Steps per second}: averaged mini-batch processing speed.
+\end{enumerate}
+
+All experiments are run with fixed random seed (42) for reproducibility.
+\newpage
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Summary Metrics Table}
+
+\begin{table}[H]
+\centering
+\caption{Optimizer Comparison by Key Metrics}
+\label{tab:results}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Metric} & \textbf{AdamW} & \textbf{Muon} & \textbf{Hybrid} \\
+\midrule
+Training time & \textbf{7m 41s} & 9m 22s & 8m 23s \\
+Peak memory, MB & 3912 & \textbf{3846} & 3878 \\
+Final loss & \textbf{2.863} & 2.903 & 2.888 \\
+PIQA Accuracy, \% & \textbf{70.29} & 70.13 & 69.86 \\
+Steps per second & \textbf{0.682} & 0.560 & 0.626 \\
+Trainable params & \multicolumn{3}{c}{8.8M (1.75\% of total)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Optimizer Hyperparameters Used in Experiments}
+\label{tab:hyperparams}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Parameter} & \textbf{AdamW} & \textbf{Muon} & \textbf{Hybrid} \\
+\midrule
+$\beta_1$ & 0.9 & 0.9 & 0.9 \\
+$\beta_2$ & 0.999 & 0.95 & 0.95 \\
+$\epsilon$ & $10^{-8}$ & $10^{-7}$ & $10^{-7}$ \\
+Weight decay ($\lambda$) & 0.01 & 0.01 & 0.1 \\
+Newton-Schulz steps ($K$) & --- & 5 & 5 \\
+LR adjustment factor & --- & $0.2 \cdot \sqrt{\max(n,m)}$ & $0.2 \cdot \sqrt{\max(n,m)}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textit{Note on reproducibility}: All experiments were run with fixed seed=42. Small metric variations ($\pm 0.1\%$ accuracy) may occur across repeated runs due to non-deterministic operations in cuBLAS and CUDA asynchrony.
+
+\subsection{Performance Analysis}
+
+\paragraph{Training speed.}
+AdamW demonstrates best performance: 0.682 steps/s vs. 0.560 for Muon ($-18\%$). This is explained by absence of Newton-Schulz iterations requiring additional matrix multiplications. The hybrid approach occupies an intermediate position (0.626 steps/s), as only half of parameters are processed by the heavier Muon.
+
+\paragraph{Memory consumption.}
+Muon saves $\sim$66 MB ($\sim$1.7\%) GPU memory compared to AdamW by using a single moment buffer instead of two. The hybrid method consumes intermediate memory, proportional to the fraction of parameters processed by each optimizer.
+
+\paragraph{Training quality.}
+All three methods achieve comparable final loss ($\sim$2.86--2.90) and PIQA accuracy ($\sim$70\%). Small differences (less than 0.5\% accuracy) are statistically insignificant given the data volume (1000 training samples). This indicates that for small-scale tasks, optimizer choice primarily affects efficiency rather than final quality.
+
+\paragraph{Convergence dynamics.}
+Log analysis shows all optimizers exhibit monotonic loss decrease without divergence signs. In early stages (first 2 epochs), Muon sometimes shows sharper oscillations, possibly due to iterative nature of orthogonalization. By training end, trajectories of all methods stabilize.
+\newpage
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+This work conducted a detailed comparative analysis of three optimizers for LoRA fine-tuning of large language models:
+
+\begin{enumerate}
+    \item \textbf{AdamW} remains a reliable choice for most practical tasks: it is fast, stable, and well-studied. Its per-parameter adaptivity effectively handles multi-scale gradients, while weight decay correction improves generalization.
+    
+    \item \textbf{Muon} offers an innovative approach via matrix orthogonalization, theoretically accelerating convergence in tasks with correlated gradients. The implementation is adapted from the \texttt{MoonshotAI/Moonlight} repository~\cite{moonshot2024muon}. In practice, it saves memory and shows comparable quality but requires more computation.
+    
+    \item \textbf{Hybrid} demonstrates that method combination can yield balanced results. The proposed parameter partitioning strategy (first 50\% of 2D matrices $\rightarrow$ Muon, rest $\rightarrow$ AdamW) is a simple yet effective heuristic.
+\end{enumerate}
+
+\textbf{Key finding}: for small-to-medium scale tasks (as in this experiment), differences in final quality between optimizers are minimal. Selection should be based on time and memory constraints: AdamW for speed, Muon for resource savings, Hybrid for balance.
+
+\textbf{Work limitations}: Implementation of the MeZO optimizer~\cite{mezo2023} was optional (challenge) within the technical specification and was not completed in this study. Priority was given to detailed analysis of AdamW, Muon, and their hybrid combination.
+
+\section*{References}
+\label{sec:references}
+
+\begin{thebibliography}{9}
+
+\bibitem{hu2021lora}
+Hu E. J. et al. 
+\textit{LoRA: Low-Rank Adaptation of Large Language Models}. 
+arXiv preprint arXiv:2106.09685, 2021.
+
+\bibitem{loshchilov2019adamw}
+Loshchilov I., Hutter F. 
+\textit{Decoupled Weight Decay Regularization}. 
+International Conference on Learning Representations (ICLR), 2019.
+
+\bibitem{moonshot2024muon}
+Liu J. et al. 
+\textit{Muon is Scalable for LLM Training}. 
+arXiv preprint arXiv:2502.16982, 2025. 
+\url{https://github.com/MoonshotAI/Moonlight}
+
+\bibitem{mezo2023}
+Malladi S. et al. 
+\textit{MeZO: Memory-Efficient Zeroth-Order Optimizer for LLM Fine-tuning}. 
+arXiv preprint arXiv:2305.17333, 2023.
+
+\bibitem{bisk2020piqa}
+Bisk Y. et al. 
+\textit{PIQA: Reasoning about Physical Commonsense in Natural Language}. 
+Proceedings of the AAAI Conference on Artificial Intelligence, 2020.
+
+\bibitem{schulz1933newton}
+Schulz G. 
+\textit{Iterative Berechnung der reziproken Matrix}. 
+Zeitschrift für Angewandte Mathematik und Mechanik, 1933.
+
+\end{thebibliography}
+\end{document}
