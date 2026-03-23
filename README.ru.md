@@ -166,9 +166,10 @@ outputs/
 ├── checkpoints/
 │   ├── metrics_{optimizer}.json   # Метрики на каждом шаге
 │   ├── results_{optimizer}.json   # Итоговая сводка + оценка на PIQA
-│   └── adapter_model/             # Веса LoRA (формат PEFT)
-└── logs/
-    └── training_{timestamp}.log
+│   └── checkpoint-*/              # Веса LoRA (формат PEFT)
+└── YYYY-MM-DD/
+        └── hh-mm-ss/
+            └── main.log           # Сохраненные логи
 ```
 
 ---
